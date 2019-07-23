@@ -1,0 +1,207 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: vsystem-iptables-privilege-granter
+  annotations:
+    openshift.io/display-name: "Insecure registry setter for SAP Data Hub Pipeline Modeler"
+    description: >
+      On Red Hat Enterprise Linux CoreOS, container needs to be run as privileged
+      in order to manage iptables on the host system. SAP Data Hub containers named
+      "vsystem-iptables" deployed as part of every "vsystem-app" deployment attempt
+      to modify iptables rules without having the necessary permissions. This
+      template fixes the permissions on-the-fly as the deployments are created.
+
+      The template spawns a pod that observes the particular namespace where
+      SAP Data Hub runs and marks each "vsystem-iptables" container in all
+      "vsystem-app" deployments as privileged.
+
+      Usage:
+        If running in the same namespace as Data Hub, instantiate the template
+        as is in the desired namespace:
+
+          oc project $SDH_NAMESPACE
+          oc process vsystem-iptables-privilege-granter | oc create -f -
+
+        If running in a different/new namespace/project, instantiate the
+        template with parameters SDH_NAMESPACE and NAMESPACE, e.g.:
+
+          oc new-project sapdatahub-admin
+          oc process vsystem-iptables-privilege-granter \
+              SDH_NAMESPACE=$SDH_NAMESPACE \
+              NAMESPACE=sapdatahub-admin | oc create -f -
+
+    openshift.io/provider-display-name: "Red Hat, Inc." 
+    openshift.io/documentation-url: "https://access.redhat.com/articles/3630111" 
+message: >-
+  The vsystem-app observer and patcher will be started. You can watch the progress
+  with the following command:
+
+    oc logs -f dc/vsystem-app-observer
+objects:
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: vsystem-app-observer
+    namespace: ${NAMESPACE}
+
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: vsystem-app-observer
+    namespace: ${SDH_NAMESPACE}
+  rules:
+  - apiGroups:
+    - apps
+    - extensions
+    resources:
+    - deployments
+    - deployments/scale
+    verbs:
+    - get
+    - list
+    - patch
+    - watch
+  - apiGroups:
+    - ""
+    resources:
+    # necessary to get the configured registry out of secrets/installer-config
+    - secrets
+    verbs:
+    - get
+  # mandatory permissions if running in a different namespace
+  - apiGroups:
+    - ""
+    resources:
+    - namespaces
+    - namespaces/status
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - ""
+    - project.openshift.io
+    resources:
+    - projects
+    verbs:
+    - get
+
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata:
+    namespace: ${SDH_NAMESPACE}
+    name: vsystem-app-observer-${ROLE_BINDING_SUFFIX}
+  roleRef:
+    name: vsystem-app-observer
+    kind: Role
+    namespace: ${SDH_NAMESPACE}
+  subjects:
+  - kind: ServiceAccount
+    name: vsystem-app-observer
+    namespace: ${NAMESPACE}
+
+- apiVersion: v1
+  kind: DeploymentConfig
+  metadata:
+    name: vsystem-app-observer
+    namespace: ${NAMESPACE}
+    labels:
+      name: observer
+  spec:
+    selector:
+      name: observer
+    replicas: 1
+    strategy:
+      type: Rolling
+    triggers:
+    - type: "ConfigChange"
+    template:
+      metadata:
+        labels:
+          name: observer
+          target: "vsystem-app.datahub.sap.com"
+      spec:
+        containers:
+        - env:
+          - name: SDH_NAMESPACE
+            value: ${SDH_NAMESPACE}
+          image: "${BASE_IMAGE}:${BASE_IMAGE_TAG}"
+          name: observer
+          command:
+          - /bin/bash
+          args:
+          - "-c"
+          - |
+            if [[ -n "${SDH_NAMESPACE:-}" ]]; then
+              export HOME="$(mktemp -d)"  # so that oc can create $HOME/.kube/ directory
+              oc project "${SDH_NAMESPACE}"
+            fi
+            # support both 3.x and 4.x output formats
+            version="$(oc version --short 2>/dev/null || oc version)"
+            server_version="$(sed -n 's/^\([sS]erver.*:\|[oO]pen[sS]hift\) v\([0-9]\+\.[0-9]\+\).*/\2/p' \
+                              <<<"$version" | head -n 1)"
+            client_version="$(sed -n 's/^\([cC]lient.*:\|oc\) v\([0-9]\+\.[0-9]\+\).*/\2/p' \
+                              <<<"$version" | head -n 1)"
+            # translate k8s 1.13 to ocp 4.1
+            if [[ "${server_version:-}" =~ ^1\.([0-9]+)$ ]]; then
+              server_version="4.$((${BASH_REMATCH[1]} - 12))"
+            fi
+            if [[ -z "${client_version:-}" ]]; then
+              printf 'WARNING: Failed to determine oc client version!\n' >&2
+            elif [[ "${server_version}" != "${client_version}" ]]; then
+              printf 'WARNING: Client version != Server version (%s != %s).\n' "$client_version" "$server_version" >&2
+              printf '         Please reinstantiate this template with the correct BASE_IMAGE_TAG parameter (e.g. v%s)."\n' >&2 \
+                "$server_version"
+            elif [[ "${server_version}" =~ ^3\. ]]; then
+              printf 'No need to patch vsystem pods on OpenShift ${server_version}. Exiting.\n'
+            fi
+            gotmpl='{{if eq (index .metadata.labels "datahub.sap.com/app-component") "vsystem-app"}}'
+            gotmpl+='{{range $i, $c := .spec.template.spec.containers}}{{if eq .name "vsystem-iptables"}}'
+            gotmpl+=$'{{$i}}:{{not $c.securityContext.privileged}}\n{{end}}{{end}}{{end}}'
+            while read -u 3 -r _ _ _ _ _ _ name; do
+              [[ -z "${name:-}" ]] && continue
+              oc get deploy "$name" -o go-template="$gotmpl" 2>/dev/null | while IFS=: read -r index unprivileged; do
+                if [[ "$unprivileged" == "true" ]]; then
+                  printf 'Patching container #%d in deployment/%s to make its pods privileged ...\n' "$index" "$name" >&2
+                  oc patch "deploy/$name" --type json -p '[{
+                    "op": "add",
+                    "path": "/spec/template/spec/containers/'"$index"'/securityContext/privileged",
+                    "value": true
+                  }]'
+                else
+                  printf 'Container #%d in deployment/%s already patched, skipping ...\n' "$index" "$name" >&2
+                fi
+              done
+            done 3< <(oc observe deploy)
+        restartPolicy: Always
+        serviceAccount: vsystem-app-observer
+        serviceAccountName: vsystem-app-observer
+
+parameters:
+  - name: BASE_IMAGE
+    required: true
+    value: quay.io/openshift/origin-cli
+    description: >
+      Base image containing the command line utilities suitable for interaction
+      with the OpenShift cluster. It must contain at least oc and bash
+      binaries.
+  - description: >
+      The tag of BASE_IMAGE to pull. The tag shall correspond to the OpenShift release of the cluster.
+    name: BASE_IMAGE_TAG
+    required: true
+    value: "4.1"
+  - name: SDH_NAMESPACE
+    description: >
+      The name of the SAP Data Hub namespace to manage. Defaults to the current
+      one. It must be set only in case the observer is running in a differnt
+      namespace (see NAMESPACE).
+  - name: NAMESPACE
+    description: >
+      The desired namespace, where the vsystem-app observer shall run. Defaults to
+      the current one. Needs to be set only if running the observer outside of
+      SDH_NAMESPACE.
+  - name: ROLE_BINDING_SUFFIX
+    description: >
+      A random suffix for the new RoleBinding's name. No need to edit.
+    generate: expression
+    from: '[a-z0-9]{5}'
