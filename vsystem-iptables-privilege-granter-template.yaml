@@ -56,6 +56,8 @@ objects:
     resources:
     - deployments
     - deployments/scale
+    - statefulsets
+    - statefulsets/scale
     verbs:
     - get
     - list
@@ -132,6 +134,8 @@ objects:
           args:
           - "-c"
           - |
+            set -euo pipefail
+            IFS=$'\n\t'
             if [[ -n "${SDH_NAMESPACE:-}" ]]; then
               export HOME="$(mktemp -d)"  # so that oc can create $HOME/.kube/ directory
               oc project "${SDH_NAMESPACE}"
@@ -155,25 +159,88 @@ objects:
             elif [[ "${server_version}" =~ ^3\. ]]; then
               printf 'No need to patch vsystem pods on OpenShift ${server_version}. Exiting.\n'
             fi
-            gotmpl='{{if eq (index .metadata.labels "datahub.sap.com/app-component") "vsystem-app"}}'
-            gotmpl+='{{range $i, $c := .spec.template.spec.containers}}{{if eq .name "vsystem-iptables"}}'
-            gotmpl+=$'{{$i}}:{{not $c.securityContext.privileged}}\n{{end}}{{end}}{{end}}'
-            printf 'Watching namespace "%s" for vsystem-apps deployments...\n' "$SDH_NAMESPACE"
-            while read -u 3 -r _ _ _ _ _ _ name; do
-              [[ -z "${name:-}" ]] && continue
-              oc get deploy "$name" -o go-template="$gotmpl" 2>/dev/null | while IFS=: read -r index unprivileged; do
-                if [[ "$unprivileged" == "true" ]]; then
-                  printf 'Patching container #%d in deployment/%s to make its pods privileged ...\n' "$index" "$name" >&2
-                  oc patch "deploy/$name" --type json -p '[{
-                    "op": "add",
-                    "path": "/spec/template/spec/containers/'"$index"'/securityContext/privileged",
-                    "value": true
-                  }]'
-                else
-                  printf 'Container #%d in deployment/%s already patched, skipping ...\n' "$index" "$name" >&2
+            function observe() {
+              oc observe --listen-addr=:11252 statefulset &
+              oc observe --listen-addr=:11251 deploy      &
+              while true; do
+                sleep 0.1
+                if [[ "$(jobs -r | wc -l)" -lt 2 ]]; then
+                  # terminate all the process in the container
+                  kill -9 -- `ps -ahx | awk '{print $1}' | grep -v -F "$BASHPID" | tac`
                 fi
               done
-            done 3< <(oc observe deploy)
+            }
+            gotmplarr=(
+              '{{range $di, $d := .items}}'
+                '{{if eq .kind "Deployment"}}'
+                  # vsystem-app deployment
+                  '{{if eq (index .metadata.labels "datahub.sap.com/app-component") "vsystem-app"}}'
+                    '{{range $i, $c := .spec.template.spec.containers}}'
+                      '{{if eq .name "vsystem-iptables"}}'
+                       $'{{$d.kind}}:{{$i}}:{{not $c.securityContext.privileged}}\n'
+                      '{{end}}'
+                    '{{end}}'
+                  '{{end}}'
+                '{{else}}'
+                  # vsystem-vrep statefulset
+                  '{{if eq .metadata.name "vsystem-vrep"}}'
+                    '{{.kind}}'
+                    '{{range $i, $c := .spec.template.spec.containers}}'
+                      '{{if eq $c.name "vsystem-vrep"}}'
+                        ':{{$i}}'
+                        '{{range $vmi, $vm := $c.volumeMounts}}'
+                          '{{if eq $vm.mountPath "/exports"}}'
+                            ':{{$vm.name}}'
+                          '{{end}}'
+                        '{{end}}'
+                      '{{end}}'
+                    '{{end}}'
+                    $'\n'
+                  '{{end}}'
+                '{{end}}'
+              '{{end}}'
+            )
+            printf 'Watching namespace "%s" for vsystem-apps deployments...\n' "$SDH_NAMESPACE"
+            while IFS=' ' read -u 3 -r _ _ _ _ _ name; do
+              [[ -z "${name:-}" ]] && continue
+              #-o go-template="$(printf '%s' "${gotmplarr[@]}")" 2>/dev/null | \
+              ( oc get deploy/"$name" statefulset/"$name" \
+                    -o go-template="$(printf '%s' "${gotmplarr[@]}")" ||: ; ) | \
+                  while IFS=: read -r kind index rest;
+              do
+                case "${kind,,}" in
+                deployment)
+                  if [[ "$rest" == "true" ]]; then
+                    printf 'Patching container #%d in deployment/%s to make its pods privileged ...\n' \
+                        "$index" "$name" >&2
+                    oc patch "deploy/$name" --type json -p '[{
+                      "op": "add",
+                      "path": "/spec/template/spec/containers/'"$index"'/securityContext/privileged",
+                      "value": true
+                    }]'
+                  else
+                    printf 'Container #%d in deployment/%s already patched, skipping ...\n' "$index" "$name" >&2
+                  fi
+                  ;;
+                statefulset)
+                  if [[ -n "${index:-}" && -n "${rest:-}" ]]; then
+                    printf 'statefulset/vsystem-vrep already patched, skipping ...\n' >&2
+                  else
+                    printf 'Adding emptyDir volume to statefulset/vsystem-vrep ...\n' >&2
+                    oc patch "statefulset/vsystem-vrep" --type json -p '[{
+                      "op": "add",
+                      "path": "/spec/template/spec/containers/'"$index"'/volumeMounts/0",
+                      "value": {"mountPath": "/exports", "name": "exports-volume"}
+                    }, {
+                      "op": "add",
+                      "path": "/spec/template/spec/volumes/0",
+                      "value": {"emptyDir": {}, "name": "exports-volume"}
+                    }]'
+                  fi
+                  ;;
+                esac
+              done
+            done 3< <(observe)
         restartPolicy: Always
         serviceAccount: vsystem-app-observer
         serviceAccountName: vsystem-app-observer
