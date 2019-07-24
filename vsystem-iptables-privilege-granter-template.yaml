@@ -158,6 +158,7 @@ objects:
             gotmpl='{{if eq (index .metadata.labels "datahub.sap.com/app-component") "vsystem-app"}}'
             gotmpl+='{{range $i, $c := .spec.template.spec.containers}}{{if eq .name "vsystem-iptables"}}'
             gotmpl+=$'{{$i}}:{{not $c.securityContext.privileged}}\n{{end}}{{end}}{{end}}'
+            printf 'Watching namespace "%s" for vsystem-apps deployments...\n' "$SDH_NAMESPACE"
             while read -u 3 -r _ _ _ _ _ _ name; do
               [[ -z "${name:-}" ]] && continue
               oc get deploy "$name" -o go-template="$gotmpl" 2>/dev/null | while IFS=: read -r index unprivileged; do
