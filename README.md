@@ -17,6 +17,20 @@ Targeted at:
 - OpenShift 4.1 or higher
 - SAP Data Hub is 2.6 or higher
 
+**NOTE**: you will likely see the very first deployment of license-management
+during the SAP Data Hub's installation to fail with a message like the following:
+
+```
+2019-07-24T07:28:54+0000 [INFO] Solutions were successfully imported!
+2019-07-24T07:28:54+0000 [INFO] Initializing system tenant...
+2019-07-24T07:28:54+0000 [INFO] Initializing License Manager in system tenant...2019-07-24T07:29:35+0000 [ERROR] Couldn't start License Manager!
+The response: Error: http status code 502 Bad Gateway (502)
+2019-07-24T07:29:35+0000 [ERROR] Failed to initialize vSystem, will retry in 30 sec...
+2019-07-24T07:30:05+0000 [INFO] Wait until vora cluster is ready...
+```
+
+The error is harmless and can be ignored. The next deployment will succeed.
+
 ## Usage
 
 The `ivsystem-iptables-privilege-granter-template.yaml` template shall be deployed
