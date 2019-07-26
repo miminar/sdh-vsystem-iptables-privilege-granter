@@ -15,6 +15,10 @@ metadata:
       SAP Data Hub runs and marks each "vsystem-iptables" container in all
       "vsystem-app" deployments as privileged.
 
+      Additionally vsystem-vrep statefulset will be patched to mount `emptyDir` volume
+      at `/exports` directory in order to enable NFS exports in the container running
+      on top overlayfs which is the default filesystem in RHCOS.
+
       Usage:
         If running in the same namespace as Data Hub, instantiate the template
         as is in the desired namespace:
@@ -36,19 +40,23 @@ message: >-
   The vsystem-app observer and patcher will be started. You can watch the progress
   with the following command:
 
-    oc logs -f dc/vsystem-app-observer
+    oc logs -f dc/vsystem-observer
 objects:
 - apiVersion: v1
   kind: ServiceAccount
   metadata:
-    name: vsystem-app-observer
+    name: vsystem-observer
     namespace: ${NAMESPACE}
+    labels:
+      deploymentconfig: vsystem-observer
 
 - apiVersion: rbac.authorization.k8s.io/v1
   kind: Role
   metadata:
-    name: vsystem-app-observer
+    name: vsystem-observer
     namespace: ${SDH_NAMESPACE}
+    labels:
+      deploymentconfig: vsystem-observer
   rules:
   - apiGroups:
     - apps
@@ -70,6 +78,13 @@ objects:
     - secrets
     verbs:
     - get
+  - apiGroups:
+    - ""
+    resources:
+    - pods
+    verbs:
+    - get
+    - list
   # mandatory permissions if running in a different namespace
   - apiGroups:
     - ""
@@ -92,26 +107,44 @@ objects:
   kind: RoleBinding
   metadata:
     namespace: ${SDH_NAMESPACE}
-    name: vsystem-app-observer-${ROLE_BINDING_SUFFIX}
+    name: vsystem-observer-${ROLE_BINDING_SUFFIX}
+    labels:
+      deploymentconfig: vsystem-observer
   roleRef:
-    name: vsystem-app-observer
+    apiGroup: rbac.authorization.k8s.io
     kind: Role
+    name: vsystem-observer
     namespace: ${SDH_NAMESPACE}
   subjects:
   - kind: ServiceAccount
-    name: vsystem-app-observer
+    name: vsystem-observer
+    namespace: ${NAMESPACE}
+
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: vsystem-observer-2-node-reader-${ROLE_BINDING_SUFFIX}
+    labels:
+      deploymentconfig: vsystem-observer
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:node-reader
+  subjects:
+  - kind: ServiceAccount
+    name: vsystem-observer
     namespace: ${NAMESPACE}
 
 - apiVersion: v1
   kind: DeploymentConfig
   metadata:
-    name: vsystem-app-observer
+    name: vsystem-observer
     namespace: ${NAMESPACE}
     labels:
-      name: observer
+      deploymentconfig: vsystem-observer
   spec:
     selector:
-      name: observer
+      deploymentconfig: vsystem-observer
     replicas: 1
     strategy:
       type: Rolling
@@ -120,15 +153,17 @@ objects:
     template:
       metadata:
         labels:
-          name: observer
+          deploymentconfig: vsystem-observer
           target: "vsystem-app.datahub.sap.com"
       spec:
         containers:
         - env:
           - name: SDH_NAMESPACE
             value: ${SDH_NAMESPACE}
+          - name: DRY_RUN
+            value: ${DRY_RUN}
           image: "${BASE_IMAGE}:${BASE_IMAGE_TAG}"
-          name: observer
+          name: vsystem-observer
           command:
           - /bin/bash
           args:
@@ -139,36 +174,84 @@ objects:
             if [[ -n "${SDH_NAMESPACE:-}" ]]; then
               export HOME="$(mktemp -d)"  # so that oc can create $HOME/.kube/ directory
               oc project "${SDH_NAMESPACE}"
+            else
+              SDH_NAMESPACE="$(oc project -q 2>/dev/null|| :)"
             fi
             # support both 3.x and 4.x output formats
             version="$(oc version --short 2>/dev/null || oc version)"
-            server_version="$(sed -n 's/^\([sS]erver.*:\|[oO]pen[sS]hift\) v\([0-9]\+\.[0-9]\+\).*/\2/p' \
+            serverVersion="$(sed -n 's/^\([sS]erver.*:\|[oO]pen[sS]hift\) v\([0-9]\+\.[0-9]\+\).*/\2/p' \
                               <<<"$version" | head -n 1)"
-            client_version="$(sed -n 's/^\([cC]lient.*:\|oc\) v\([0-9]\+\.[0-9]\+\).*/\2/p' \
+            clientVersion="$(sed -n 's/^\([cC]lient.*:\|oc\) v\([0-9]\+\.[0-9]\+\).*/\2/p' \
                               <<<"$version" | head -n 1)"
             # translate k8s 1.13 to ocp 4.1
-            if [[ "${server_version:-}" =~ ^1\.([0-9]+)$ ]]; then
-              server_version="4.$((${BASH_REMATCH[1]} - 12))"
+            if [[ "${serverVersion:-}" =~ ^1\.([0-9]+)$ ]]; then
+              serverVersion="4.$((${BASH_REMATCH[1]} - 12))"
             fi
-            if [[ -z "${client_version:-}" ]]; then
+            if [[ -z "${clientVersion:-}" ]]; then
               printf 'WARNING: Failed to determine oc client version!\n' >&2
-            elif [[ "${server_version}" != "${client_version}" ]]; then
-              printf 'WARNING: Client version != Server version (%s != %s).\n' "$client_version" "$server_version" >&2
+            elif [[ "${serverVersion}" != "${clientVersion}" ]]; then
+              printf 'WARNING: Client version != Server version (%s != %s).\n' "$clientVersion" "$serverVersion" >&2
               printf '         Please reinstantiate this template with the correct BASE_IMAGE_TAG parameter (e.g. v%s)."\n' >&2 \
-                "$server_version"
-            elif [[ "${server_version}" =~ ^3\. ]]; then
-              printf 'No need to patch vsystem pods on OpenShift ${server_version}. Exiting.\n'
+                "$serverVersion"
+            elif [[ "${serverVersion}" =~ ^3\. ]]; then
+              printf 'No need to patch vsystem pods on OpenShift ${serverVersion}. Exiting.\n'
             fi
+            function terminate() {
+              # terminate all the process in the container once one observer dies
+              kill -9 -- `ps -ahx | awk '{print $1}' | grep -v -F "$BASHPID" | tac`
+            }
             function observe() {
               oc observe --listen-addr=:11252 statefulset &
               oc observe --listen-addr=:11251 deploy      &
               while true; do
                 sleep 0.1
                 if [[ "$(jobs -r | wc -l)" -lt 2 ]]; then
-                  # terminate all the process in the container
-                  kill -9 -- `ps -ahx | awk '{print $1}' | grep -v -F "$BASHPID" | tac`
+                  terminate
                 fi
               done
+            }
+            function getPatchedNodeKeyValueForPod() {
+              local podName="$1"
+              local nodeName="$(oc get -o jsonpath=$'{.spec.nodeName}\n' "pod/${podName}")"
+              oc get -o jsonpath="$nodeName:"$'{.status.nodeInfo.bootID}\n' "node/$nodeName"
+            }
+            function getPatchedNodeKeyValuesForDeployment() {
+              local deploymentName="$1"
+              local uuid="$(oc get -o go-template=$'{{index .metadata.labels "vsystem.datahub.sap.com/uuid"}}\n' "deploy/${deploymentName}")"
+              local name
+              while IFS=: read -u 4 -r name phase;
+              do
+                [[ "$phase" == Running ]] || continue
+                getPatchedNodeKeyValueForPod "$name"
+              done 4< <(oc get pods -l "vsystem.datahub.sap.com/uuid=$uuid" \
+                          -o go-template=$'{{range .items}}{{.metadata.name}}:{{.status.phase}}\n{{end}}')
+            }
+            function updatePatchedNodes() {
+              local line
+              local nodeName
+              local cleanup="$( [[ ! -e /tmp/patched-nodes ]] && echo $? || echo $?; )"
+              while read -r line; do
+                if grep -q -F "^$line\$" /tmp/patched-nodes; then
+                  continue
+                fi
+                if [[ "$cleanup" == 1 ]]; then
+                  nodeName="${line%%:*}"
+                  sed -i "/^$nodeName/d" /tmp/patched-nodes
+                fi
+                printf '%s\n' "$line" >> /tmp/patched-nodes
+              done
+            }
+            if printf '%s\n' "${DRY_RUN:-}" | grep -q -i '^\s*\(y\(es\)\?\|true\|1\)\s*$'; then
+              DRY_RUN=1
+            else
+              DRY_RUN=0
+            fi
+            function runOrLog() {
+              if [[ "${DRY_RUN}" == 1 ]]; then
+                echo "$@"
+              else
+                "$@"
+              fi
             }
             gotmplarr=(
               '{{range $di, $d := .items}}'
@@ -177,7 +260,25 @@ objects:
                   '{{if eq (index .metadata.labels "datahub.sap.com/app-component") "vsystem-app"}}'
                     '{{range $i, $c := .spec.template.spec.containers}}'
                       '{{if eq .name "vsystem-iptables"}}'
-                       $'{{$d.kind}}:{{$i}}:{{not $c.securityContext.privileged}}\n'
+                        '{{$d.kind}}/'
+                        '{{with $s := $d.status}}'
+                          '{{with $s.replicas}}'
+                            '{{with $s.availableReplicas}}'
+                              '{{if and (eq $s.replicas .) (and (gt . 0.1) (eq . $s.readyReplicas))}}'
+                                'ready'
+                              '{{else}}'
+                                'unready'
+                              '{{end}}'
+                            # when .status.availableReplicas is undefined
+                            '{{else}}'
+                              'unready'
+                            '{{end}}'
+                          # when .status.replicas is undefined
+                          '{{else}}'
+                            'unready'
+                          '{{end}}'
+                        '{{end}}'
+                       $':{{$i}}:{{not $c.securityContext.privileged}}\n'
                       '{{end}}'
                     '{{end}}'
                   '{{end}}'
@@ -200,26 +301,54 @@ objects:
                 '{{end}}'
               '{{end}}'
             )
-            printf 'Watching namespace "%s" for vsystem-apps deployments...\n' "$SDH_NAMESPACE"
+            lackingPermissions=0
+            for perm in get/nodes get/projects get/pods get/secrets \
+                      watch/deployments get/deployments watch/statefulsets get/statefulsets \
+                      patch/deployments patch/statefulsets;
+            do
+              if ! oc auth can-i "${perm%%/*}" "${perm##*/}" >/dev/null; then
+                printf 'Cannot "%s" "%s", please grant the needed permissions' >&2 "${perm%%/*}" "${perm##*/}"
+                printf ' to vsystem-observer service account!\n'
+                lackingPermissions=1
+              fi
+            done
+            [[ "${lackingPermissions:-0}" == 1 ]] && terminate
+            if [[ -n "${SDH_NAMESPACE:-}" ]]; then
+              printf 'Watching namespace "%s" for vsystem-apps deployments...\n' "$SDH_NAMESPACE"
+            fi
             while IFS=' ' read -u 3 -r _ _ _ _ _ name; do
               [[ -z "${name:-}" ]] && continue
-              #-o go-template="$(printf '%s' "${gotmplarr[@]}")" 2>/dev/null | \
               ( oc get deploy/"$name" statefulset/"$name" \
-                    -o go-template="$(printf '%s' "${gotmplarr[@]}")" ||: ; ) | \
+                    -o go-template="$(printf '%s' "${gotmplarr[@]}")" 2>/dev/null ||: ; ) | \
                   while IFS=: read -r kind index rest;
               do
                 case "${kind,,}" in
-                deployment)
+                deployment/*)
                   if [[ "$rest" == "true" ]]; then
+                    allPatched=1
+                    for kv in `getPatchedNodeKeyValuesForDeployment "$name"`; do
+                      if ! grep -q -F "$kv" /tmp/patched-nodes 2>/dev/null; then
+                        allPatched=0
+                        break
+                      fi
+                    done
+                    if [[ "$allPatched" == 1 ]]; then
+                      printf 'Not patching deployment/%s because all the affected' >&2 "$name"
+                      printf ' nodes already run patched containers ...\n' >&2
+                      continue
+                    fi
                     printf 'Patching container #%d in deployment/%s to make its pods privileged ...\n' \
                         "$index" "$name" >&2
-                    oc patch "deploy/$name" --type json -p '[{
+                    runOrLog oc patch "deploy/$name" --type json -p '[{
                       "op": "add",
                       "path": "/spec/template/spec/containers/'"$index"'/securityContext/privileged",
                       "value": true
                     }]'
                   else
                     printf 'Container #%d in deployment/%s already patched, skipping ...\n' "$index" "$name" >&2
+                    if [[ "${kind##*/}" == "ready" ]]; then
+                      getPatchedNodeKeyValuesForDeployment "$name" | updatePatchedNodes
+                    fi
                   fi
                   ;;
                 statefulset)
@@ -227,7 +356,7 @@ objects:
                     printf 'statefulset/vsystem-vrep already patched, skipping ...\n' >&2
                   else
                     printf 'Adding emptyDir volume to statefulset/vsystem-vrep ...\n' >&2
-                    oc patch "statefulset/vsystem-vrep" --type json -p '[{
+                    runOrLog oc patch "statefulset/vsystem-vrep" --type json -p '[{
                       "op": "add",
                       "path": "/spec/template/spec/containers/'"$index"'/volumeMounts/0",
                       "value": {"mountPath": "/exports", "name": "exports-volume"}
@@ -242,8 +371,8 @@ objects:
               done
             done 3< <(observe)
         restartPolicy: Always
-        serviceAccount: vsystem-app-observer
-        serviceAccountName: vsystem-app-observer
+        serviceAccount: vsystem-observer
+        serviceAccountName: vsystem-observer
 
 parameters:
   - name: BASE_IMAGE
@@ -253,11 +382,17 @@ parameters:
       Base image containing the command line utilities suitable for interaction
       with the OpenShift cluster. It must contain at least oc and bash
       binaries.
-  - description: >
+  - name: BASE_IMAGE_TAG
+    description: >
       The tag of BASE_IMAGE to pull. The tag shall correspond to the OpenShift release of the cluster.
-    name: BASE_IMAGE_TAG
     required: true
     value: "4.1"
+  - name: DRY_RUN
+    description: >
+      If set to true, no action will be performed. The pod will just print what would have been
+      executed.
+    required: false
+    value: "false"
   - name: SDH_NAMESPACE
     description: >
       The name of the SAP Data Hub namespace to manage. Defaults to the current
