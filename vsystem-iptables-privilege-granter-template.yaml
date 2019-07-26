@@ -1,7 +1,7 @@
 apiVersion: template.openshift.io/v1
 kind: Template
 metadata:
-  name: vsystem-iptables-privilege-granter
+  name: vsystem-observer
   annotations:
     openshift.io/display-name: "Insecure registry setter for SAP Data Hub Pipeline Modeler"
     description: >
@@ -19,18 +19,23 @@ metadata:
       at `/exports` directory in order to enable NFS exports in the container running
       on top overlayfs which is the default filesystem in RHCOS.
 
+      The template must be instantiated before the installation of SAP Data Hub.
+      Also the namespace, where SAP Data Hub will be installed, must exist before
+      the instantiation.
+
       Usage:
         If running in the same namespace as Data Hub, instantiate the template
         as is in the desired namespace:
 
           oc project $SDH_NAMESPACE
-          oc process vsystem-iptables-privilege-granter | oc create -f -
+          oc process vsystem-observer | oc create -f -
 
         If running in a different/new namespace/project, instantiate the
         template with parameters SDH_NAMESPACE and NAMESPACE, e.g.:
 
+          oc new-project $SDH_NAMESPACE
           oc new-project sapdatahub-admin
-          oc process vsystem-iptables-privilege-granter \
+          oc process vsystem-observer \
               SDH_NAMESPACE=$SDH_NAMESPACE \
               NAMESPACE=sapdatahub-admin | oc create -f -
 
