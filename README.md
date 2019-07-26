@@ -39,7 +39,7 @@ The error is harmless and can be ignored. The next deployment will succeed.
 
 ## Usage
 
-The `ivsystem-iptables-privilege-granter-template.yaml` template shall be deployed
+The `vsystem-observer.yaml` template shall be deployed
 before SAP Data Hub's installation either in the same namespace/project
 or in a different one.
 
