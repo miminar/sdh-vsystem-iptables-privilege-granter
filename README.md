@@ -10,7 +10,13 @@ The template spawns a pod that observes the particular namespace where
 SAP Data Hub runs and marks each `"vsystem-iptables"` container in all
 `"vsystem-app"` deployments as *privileged*.
 
-The template shall be instantiated before the SAP Data Hub's installation.
+Additionally `vsystem-vrep` `statefulset` will be patched to mount `emptyDir`
+volume at `/exports` directory in order to enable NFS exports in the container
+running on top overlayfs which is the default filesystem in RHCOS.
+
+The template must be instantiated before the SAP Data Hub's installation.
+Both the target namespace and the namespace where the SAP Data Hub will be
+instaled must exist before the instantiation.
 
 Targeted at:
 
@@ -37,23 +43,28 @@ The `ivsystem-iptables-privilege-granter-template.yaml` template shall be deploy
 before SAP Data Hub's installation either in the same namespace/project
 or in a different one.
 
+Required arguments:
+
+- `NAMESPACE` - the project name, where the template shall be instantiated
+
 ### Deploying in the Data Hub project
 
 If running the observer in the same namespace/project as Data Hub, instantiate the
 template as is in the desired namespace:
 
     oc project $SDH_NAMESPACE
-    oc process -f https://raw.githubusercontent.com/miminar/sdh-vsystem-iptables-privilege-granter/master/vsystem-iptables-privilege-granter-template.yaml \
-       | oc create -f -
+    oc process -f https://raw.githubusercontent.com/miminar/sdh-vsystem-observer/master/vsystem-observer.yaml \
+        NAMESPACE=$SDH_NAMESPACE | oc create -f -
 
 ### Deploying in a different project
 
 If running in a different/new namespace/project, instantiate the
 template with parameters `SDH_NAMESPACE` and `NAMESPACE`, e.g.:
 
-    SDH_NAMESPACE=sdh26
-    NAMESPACE=sapdatahub-admin
+    SDH_NAMESPACE=sdh26                 # where SDH will be installed
+    NAMESPACE=sapdatahub-admin          # where the contents of this template will be instantiated
+    oc new-project $SDH_NAMESPACE
     oc new-project $NAMESPACE
-    oc process -f https://raw.githubusercontent.com/miminar/sdh-vsystem-iptables-privilege-granter/master/vsystem-iptables-privilege-granter-template.yaml \ \
+    oc process -f https://raw.githubusercontent.com/miminar/sdh-vsystem-observer/master/vsystem-observer.yaml \
         SDH_NAMESPACE=$SDH_NAMESPACE NAMESPACE=$NAMESPACE | oc create -f -
 

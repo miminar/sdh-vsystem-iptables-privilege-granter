@@ -28,7 +28,7 @@ metadata:
         as is in the desired namespace:
 
           oc project $SDH_NAMESPACE
-          oc process vsystem-observer | oc create -f -
+          oc process vsystem-observer NAMESPACE=$SDH_NAMESPACE | oc create -f -
 
         If running in a different/new namespace/project, instantiate the
         template with parameters SDH_NAMESPACE and NAMESPACE, e.g.:
@@ -408,6 +408,7 @@ parameters:
       The desired namespace, where the vsystem-app observer shall run. Defaults to
       the current one. Needs to be set only if running the observer outside of
       SDH_NAMESPACE.
+    required: true
   - name: ROLE_BINDING_SUFFIX
     description: >
       A random suffix for the new RoleBinding's name. No need to edit.
