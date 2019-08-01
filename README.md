@@ -1,4 +1,4 @@
-# Insecure registry setter for SAP Data Hub Pipeline Modeler
+# Deployment observer for SAP Data Hub
 
 On Red Hat Enterprise Linux CoreOS, container needs to be run as *privileged*
 in order to manage iptables on the host system. SAP Data Hub containers named
