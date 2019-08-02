@@ -222,11 +222,12 @@ objects:
             }
             function getPatchedNodeKeyValuesForDeployment() {
               local deploymentName="$1"
+              local matchPhase="${2:-}"
               local uuid="$(oc get -o go-template=$'{{index .metadata.labels "vsystem.datahub.sap.com/uuid"}}\n' "deploy/${deploymentName}")"
               local name
               while IFS=: read -u 4 -r name phase;
               do
-                [[ "$phase" == Running ]] || continue
+                [[ "$phase" =~ $matchPhase ]] || continue
                 getPatchedNodeKeyValueForPod "$name"
               done 4< <(oc get pods -l "vsystem.datahub.sap.com/uuid=$uuid" \
                           -o go-template=$'{{range .items}}{{.metadata.name}}:{{.status.phase}}\n{{end}}')
@@ -252,7 +253,7 @@ objects:
               DRY_RUN=0
             fi
             function runOrLog() {
-              if [[ "${DRY_RUN}" == 1 ]]; then
+              if grep -iq '^\(1\|true\|y\(es\)\?\)$' <<<"${DRY_RUN}"; then
                 echo "$@"
               else
                 "$@"
@@ -331,12 +332,16 @@ objects:
                 deployment/*)
                   if [[ "$rest" == "true" ]]; then
                     allPatched=1
-                    for kv in `getPatchedNodeKeyValuesForDeployment "$name"`; do
-                      if ! grep -q -F "$kv" /tmp/patched-nodes 2>/dev/null; then
-                        allPatched=0
-                        break
-                      fi
-                    done
+                    if [[ ! -e /tmp/patched-nodes ]]; then
+                      allPatched=0
+                    else
+                      for kv in `getPatchedNodeKeyValuesForDeployment "$name" "Pending|Running"`; do
+                        if ! grep -q -F "$kv" /tmp/patched-nodes 2>/dev/null; then
+                          allPatched=0
+                          break
+                        fi
+                      done
+                    fi
                     if [[ "$allPatched" == 1 ]]; then
                       printf 'Not patching deployment/%s because all the affected' >&2 "$name"
                       printf ' nodes already run patched containers ...\n' >&2
@@ -352,7 +357,7 @@ objects:
                   else
                     printf 'Container #%d in deployment/%s already patched, skipping ...\n' "$index" "$name" >&2
                     if [[ "${kind##*/}" == "ready" ]]; then
-                      getPatchedNodeKeyValuesForDeployment "$name" | updatePatchedNodes
+                      getPatchedNodeKeyValuesForDeployment "$name" "^Running$" | updatePatchedNodes
                     fi
                   fi
                   ;;
