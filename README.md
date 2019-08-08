@@ -1,5 +1,7 @@
 # Deployment observer for SAP Data Hub
 
+**NOTE**: obsoleted by [miminar/sdh-helpers](https://github.com/miminar/sdh-helpers)
+
 On Red Hat Enterprise Linux CoreOS, container needs to be run as *privileged*
 in order to manage iptables on the host system. SAP Data Hub containers named
 `vsystem-iptables` deployed as part of every `vsystem-app` deployment attempt
